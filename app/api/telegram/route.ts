@@ -1,7 +1,6 @@
 import { generateText } from "ai";
 import { DEFAULT_CHAT_MODEL } from "@/lib/ai/models";
 import { regularPrompt } from "@/lib/ai/prompts";
-import { getLanguageModel } from "@/lib/ai/providers";
 
 export const maxDuration = 60;
 
@@ -49,6 +48,24 @@ function telegramReply(chatId: number, text: string) {
   });
 }
 
+function sanitizeError(error: unknown) {
+  const raw =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : "Unknown AI Gateway error";
+
+  return raw
+    .replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(
+      /(api[_-]?key|token|secret)\s*[:=]\s*[^,\s]+/gi,
+      "$1=[redacted]"
+    )
+    .replace(/https?:\/\/[^\s]+/gi, "[url]")
+    .slice(0, 500);
+}
+
 export async function GET() {
   return Response.json({
     ok: true,
@@ -88,7 +105,7 @@ export async function POST(request: Request) {
       message.from?.first_name ?? message.from?.username ?? "Dera";
 
     const result = await generateText({
-      model: getLanguageModel(DEFAULT_CHAT_MODEL),
+      model: DEFAULT_CHAT_MODEL,
       system: `${regularPrompt}
 
 You are Satomi, the AI assistant inside Bigdera Agent.
@@ -96,6 +113,16 @@ Address the user as Dera💙 when natural.
 Keep Telegram replies clear, useful, and reasonably concise.
 The current Telegram user's display name is ${userName}.`,
       prompt: text,
+      maxOutputTokens: 700,
+      providerOptions: {
+        gateway: {
+          models: [
+            "openai/gpt-oss-20b",
+            "deepseek/deepseek-v3.2",
+            "xai/grok-4.1-fast-non-reasoning",
+          ],
+        },
+      },
     });
 
     return telegramReply(
@@ -103,11 +130,11 @@ The current Telegram user's display name is ${userName}.`,
       result.text || "I couldn't generate a reply for that message."
     );
   } catch (error) {
-    console.error("Telegram bridge error:", error);
+    console.error("Telegram bridge AI error:", error);
 
     return telegramReply(
       message.chat.id,
-      "I hit a temporary backend error. Try that message again."
+      `AI backend error: ${sanitizeError(error)}`
     );
   }
 }
