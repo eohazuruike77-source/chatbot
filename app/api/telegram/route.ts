@@ -1,10 +1,10 @@
-import { generateText } from "ai";
-import { DEFAULT_CHAT_MODEL } from "@/lib/ai/models";
 import { regularPrompt } from "@/lib/ai/prompts";
 
 export const maxDuration = 60;
 
 const TELEGRAM_MESSAGE_LIMIT = 4096;
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+const OPENROUTER_MODEL = "openrouter/free";
 
 type TelegramMessage = {
   message_id: number;
@@ -21,6 +21,17 @@ type TelegramMessage = {
 type TelegramUpdate = {
   update_id: number;
   message?: TelegramMessage;
+};
+
+type OpenRouterResponse = {
+  choices?: Array<{
+    message?: {
+      content?: string | Array<{ type?: string; text?: string }>;
+    };
+  }>;
+  error?: {
+    message?: string;
+  };
 };
 
 function isAuthorizedWebhook(request: Request) {
@@ -54,7 +65,7 @@ function sanitizeError(error: unknown) {
       ? error.message
       : typeof error === "string"
         ? error
-        : "Unknown AI Gateway error";
+        : "Unknown AI backend error";
 
   return raw
     .replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
@@ -66,10 +77,100 @@ function sanitizeError(error: unknown) {
     .slice(0, 500);
 }
 
+function extractAssistantText(data: OpenRouterResponse) {
+  const content = data.choices?.[0]?.message?.content;
+
+  if (typeof content === "string") {
+    return content.trim();
+  }
+
+  if (Array.isArray(content)) {
+    return content
+      .filter((item) => item.type === "text" && typeof item.text === "string")
+      .map((item) => item.text)
+      .join("\n")
+      .trim();
+  }
+
+  return "";
+}
+
+async function generateOpenRouterReply(text: string, userName: string) {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+
+  if (!apiKey) {
+    throw new Error("OPENROUTER_API_KEY is not configured");
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 45_000);
+
+  try {
+    const response = await fetch(OPENROUTER_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        "X-Title": "Bigdera Agent",
+      },
+      body: JSON.stringify({
+        model: OPENROUTER_MODEL,
+        messages: [
+          {
+            role: "system",
+            content: `${regularPrompt}\n\nYou are Satomi, the AI assistant inside Bigdera Agent.\nAddress the user as Dera💙 when natural.\nKeep Telegram replies clear, useful, and reasonably concise.\nThe current Telegram user's display name is ${userName}.`,
+          },
+          {
+            role: "user",
+            content: text,
+          },
+        ],
+        max_tokens: 700,
+        temperature: 0.7,
+      }),
+      signal: controller.signal,
+    });
+
+    let data: OpenRouterResponse = {};
+
+    try {
+      data = (await response.json()) as OpenRouterResponse;
+    } catch {
+      // Keep a clean error below when the upstream response is not JSON.
+    }
+
+    if (!response.ok) {
+      const upstreamMessage = data.error?.message;
+      throw new Error(
+        upstreamMessage
+          ? `OpenRouter ${response.status}: ${upstreamMessage}`
+          : `OpenRouter request failed with status ${response.status}`
+      );
+    }
+
+    const reply = extractAssistantText(data);
+
+    if (!reply) {
+      throw new Error("OpenRouter returned an empty response");
+    }
+
+    return reply;
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error("OpenRouter request timed out");
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export async function GET() {
   return Response.json({
     ok: true,
     service: "Bigdera Agent Telegram bridge",
+    ai: "OpenRouter Free",
   });
 }
 
@@ -104,31 +205,9 @@ export async function POST(request: Request) {
     const userName =
       message.from?.first_name ?? message.from?.username ?? "Dera";
 
-    const result = await generateText({
-      model: DEFAULT_CHAT_MODEL,
-      system: `${regularPrompt}
+    const reply = await generateOpenRouterReply(text, userName);
 
-You are Satomi, the AI assistant inside Bigdera Agent.
-Address the user as Dera💙 when natural.
-Keep Telegram replies clear, useful, and reasonably concise.
-The current Telegram user's display name is ${userName}.`,
-      prompt: text,
-      maxOutputTokens: 700,
-      providerOptions: {
-        gateway: {
-          models: [
-            "openai/gpt-oss-20b",
-            "deepseek/deepseek-v3.2",
-            "xai/grok-4.1-fast-non-reasoning",
-          ],
-        },
-      },
-    });
-
-    return telegramReply(
-      message.chat.id,
-      result.text || "I couldn't generate a reply for that message."
-    );
+    return telegramReply(message.chat.id, reply);
   } catch (error) {
     console.error("Telegram bridge AI error:", error);
 
