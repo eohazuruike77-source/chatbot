@@ -1,10 +1,22 @@
-import { regularPrompt } from "@/lib/ai/prompts";
+import {
+  createUser,
+  deleteChatById,
+  getChatsByUserId,
+  getMessagesByChatId,
+  getUser,
+  saveChat,
+  saveMessages,
+} from "@/lib/db/queries";
+import { generateUUID } from "@/lib/utils";
 
 export const maxDuration = 60;
 
 const TELEGRAM_MESSAGE_LIMIT = 4096;
+const TELEGRAM_SAFE_REPLY_LIMIT = 3500;
+const TELEGRAM_CHAT_TITLE = "Bigdera Agent Telegram";
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_MODEL = "openrouter/free";
+const MAX_MEMORY_MESSAGES = 20;
 
 type TelegramMessage = {
   message_id: number;
@@ -23,6 +35,11 @@ type TelegramUpdate = {
   message?: TelegramMessage;
 };
 
+type OpenRouterMessage = {
+  role: "system" | "user" | "assistant";
+  content: string;
+};
+
 type OpenRouterResponse = {
   choices?: Array<{
     message?: {
@@ -33,6 +50,13 @@ type OpenRouterResponse = {
     message?: string;
   };
 };
+
+const SATOMI_SYSTEM_PROMPT = `You are Satomi, the personal AI assistant inside Bigdera Agent.
+The user's preferred name is Dera💙. When you use his name, always call him Dera💙. Never call him Emmanuel.
+Be clear, practical, accurate, and reasonably concise. Match the user's casual tone when appropriate.
+You can help with writing, coding, research, planning, analysis, learning, business ideas, fashion, trading education, and general questions.
+Use normal Markdown when formatting is useful; the Telegram bridge will render it safely.
+Do not claim you completed external actions unless the system actually performed them.`;
 
 function isAuthorizedWebhook(request: Request) {
   const expectedSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
@@ -46,16 +70,61 @@ function isAuthorizedWebhook(request: Request) {
   );
 }
 
+function escapeHtml(text: string) {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function toTelegramHtml(input: string) {
+  const blocks: string[] = [];
+  const inlineCodes: string[] = [];
+
+  let text = input.replace(/```(?:[a-zA-Z0-9_+-]+)?\n?([\s\S]*?)```/g, (_match, code: string) => {
+    const index = blocks.push(`<pre>${escapeHtml(code.trim())}</pre>`) - 1;
+    return `@@TG_BLOCK_${index}@@`;
+  });
+
+  text = text.replace(/`([^`\n]+)`/g, (_match, code: string) => {
+    const index = inlineCodes.push(`<code>${escapeHtml(code)}</code>`) - 1;
+    return `@@TG_CODE_${index}@@`;
+  });
+
+  text = escapeHtml(text);
+  text = text.replace(/^#{1,6}\s+(.+)$/gm, "<b>$1</b>");
+  text = text.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+  text = text.replace(/^[-*]\s+/gm, "• ");
+
+  text = text.replace(/@@TG_CODE_(\d+)@@/g, (_match, rawIndex: string) => {
+    return inlineCodes[Number(rawIndex)] ?? "";
+  });
+
+  text = text.replace(/@@TG_BLOCK_(\d+)@@/g, (_match, rawIndex: string) => {
+    return blocks[Number(rawIndex)] ?? "";
+  });
+
+  return text.trim();
+}
+
 function telegramReply(chatId: number, text: string) {
-  const safeText =
-    text.length > TELEGRAM_MESSAGE_LIMIT
-      ? `${text.slice(0, TELEGRAM_MESSAGE_LIMIT - 16)}\n\n[truncated]`
+  const trimmed =
+    text.length > TELEGRAM_SAFE_REPLY_LIMIT
+      ? `${text.slice(0, TELEGRAM_SAFE_REPLY_LIMIT)}\n\n[truncated]`
       : text;
+
+  const formatted = toTelegramHtml(trimmed);
+  const safeText =
+    formatted.length > TELEGRAM_MESSAGE_LIMIT
+      ? formatted.slice(0, TELEGRAM_MESSAGE_LIMIT - 16) + "\n\n[truncated]"
+      : formatted;
 
   return Response.json({
     method: "sendMessage",
     chat_id: chatId,
     text: safeText,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
   });
 }
 
@@ -95,75 +164,211 @@ function extractAssistantText(data: OpenRouterResponse) {
   return "";
 }
 
-async function generateOpenRouterReply(text: string, userName: string) {
+function extractStoredText(parts: unknown) {
+  if (!Array.isArray(parts)) {
+    return "";
+  }
+
+  return parts
+    .map((part) => {
+      if (!part || typeof part !== "object") {
+        return "";
+      }
+
+      const candidate = part as { type?: unknown; text?: unknown };
+      return candidate.type === "text" && typeof candidate.text === "string"
+        ? candidate.text
+        : "";
+    })
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+}
+
+async function getOrCreateTelegramUser(telegramChatId: number) {
+  const email = `telegram-${telegramChatId}@bigdera.local`;
+  let users = await getUser(email);
+
+  if (users[0]) {
+    return users[0];
+  }
+
+  await createUser(email, generateUUID());
+  users = await getUser(email);
+
+  if (!users[0]) {
+    throw new Error("Could not initialize Telegram memory user");
+  }
+
+  return users[0];
+}
+
+async function findTelegramMemoryChat(
+  telegramChatId: number,
+  createIfMissing = true
+) {
+  const user = await getOrCreateTelegramUser(telegramChatId);
+  const { chats } = await getChatsByUserId({
+    id: user.id,
+    limit: 20,
+    startingAfter: null,
+    endingBefore: null,
+  });
+
+  const existing = chats.find((item) => item.title === TELEGRAM_CHAT_TITLE);
+
+  if (existing) {
+    return existing.id;
+  }
+
+  if (!createIfMissing) {
+    return null;
+  }
+
+  const id = generateUUID();
+  await saveChat({
+    id,
+    userId: user.id,
+    title: TELEGRAM_CHAT_TITLE,
+    visibility: "private",
+  });
+
+  return id;
+}
+
+async function loadTelegramHistory(chatId: string): Promise<OpenRouterMessage[]> {
+  const stored = await getMessagesByChatId({ id: chatId });
+
+  return stored
+    .slice(-MAX_MEMORY_MESSAGES)
+    .map((item) => {
+      const content = extractStoredText(item.parts);
+
+      if (!content || (item.role !== "user" && item.role !== "assistant")) {
+        return null;
+      }
+
+      return {
+        role: item.role as "user" | "assistant",
+        content,
+      };
+    })
+    .filter((item): item is OpenRouterMessage => item !== null);
+}
+
+async function saveTelegramExchange(
+  chatId: string,
+  userText: string,
+  assistantText: string
+) {
+  const now = new Date();
+
+  await saveMessages({
+    messages: [
+      {
+        id: generateUUID(),
+        chatId,
+        role: "user",
+        parts: [{ type: "text", text: userText }],
+        attachments: [],
+        createdAt: now,
+      },
+      {
+        id: generateUUID(),
+        chatId,
+        role: "assistant",
+        parts: [{ type: "text", text: assistantText }],
+        attachments: [],
+        createdAt: new Date(now.getTime() + 1),
+      },
+    ],
+  });
+}
+
+async function generateOpenRouterReply(messages: OpenRouterMessage[]) {
   const apiKey = process.env.OPENROUTER_API_KEY;
 
   if (!apiKey) {
     throw new Error("OPENROUTER_API_KEY is not configured");
   }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 45_000);
+  let lastError: Error | null = null;
 
-  try {
-    const response = await fetch(OPENROUTER_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        "X-Title": "Bigdera Agent",
-      },
-      body: JSON.stringify({
-        model: OPENROUTER_MODEL,
-        messages: [
-          {
-            role: "system",
-            content: `${regularPrompt}\n\nYou are Satomi, the AI assistant inside Bigdera Agent.\nAddress the user as Dera💙 when natural.\nKeep Telegram replies clear, useful, and reasonably concise.\nThe current Telegram user's display name is ${userName}.`,
-          },
-          {
-            role: "user",
-            content: text,
-          },
-        ],
-        max_tokens: 700,
-        temperature: 0.7,
-      }),
-      signal: controller.signal,
-    });
-
-    let data: OpenRouterResponse = {};
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 45_000);
 
     try {
-      data = (await response.json()) as OpenRouterResponse;
-    } catch {
-      // Keep a clean error below when the upstream response is not JSON.
+      const response = await fetch(OPENROUTER_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+          "X-Title": "Bigdera Agent",
+        },
+        body: JSON.stringify({
+          model: OPENROUTER_MODEL,
+          messages: [
+            { role: "system", content: SATOMI_SYSTEM_PROMPT },
+            ...messages,
+          ],
+          max_tokens: 700,
+          temperature: 0.65,
+          provider: {
+            allow_fallbacks: true,
+          },
+        }),
+        signal: controller.signal,
+      });
+
+      let data: OpenRouterResponse = {};
+
+      try {
+        data = (await response.json()) as OpenRouterResponse;
+      } catch {
+        // Keep a clean error below when the upstream response is not JSON.
+      }
+
+      if (!response.ok) {
+        const upstreamMessage = data.error?.message;
+        lastError = new Error(
+          upstreamMessage
+            ? `OpenRouter ${response.status}: ${upstreamMessage}`
+            : `OpenRouter request failed with status ${response.status}`
+        );
+
+        if ((response.status === 429 || response.status >= 500) && attempt === 0) {
+          await new Promise((resolve) => setTimeout(resolve, 900));
+          continue;
+        }
+
+        throw lastError;
+      }
+
+      const reply = extractAssistantText(data);
+
+      if (!reply) {
+        throw new Error("OpenRouter returned an empty response");
+      }
+
+      return reply;
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        lastError = new Error("OpenRouter request timed out");
+      } else {
+        lastError = error instanceof Error ? error : new Error(String(error));
+      }
+
+      if (attempt === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 900));
+        continue;
+      }
+    } finally {
+      clearTimeout(timeout);
     }
-
-    if (!response.ok) {
-      const upstreamMessage = data.error?.message;
-      throw new Error(
-        upstreamMessage
-          ? `OpenRouter ${response.status}: ${upstreamMessage}`
-          : `OpenRouter request failed with status ${response.status}`
-      );
-    }
-
-    const reply = extractAssistantText(data);
-
-    if (!reply) {
-      throw new Error("OpenRouter returned an empty response");
-    }
-
-    return reply;
-  } catch (error) {
-    if (error instanceof Error && error.name === "AbortError") {
-      throw new Error("OpenRouter request timed out");
-    }
-
-    throw error;
-  } finally {
-    clearTimeout(timeout);
   }
+
+  throw lastError ?? new Error("OpenRouter request failed");
 }
 
 export async function GET() {
@@ -171,6 +376,7 @@ export async function GET() {
     ok: true,
     service: "Bigdera Agent Telegram bridge",
     ai: "OpenRouter Free",
+    memory: "Postgres",
   });
 }
 
@@ -194,18 +400,73 @@ export async function POST(request: Request) {
     return Response.json({ ok: true });
   }
 
-  if (text === "/start") {
+  const command = text.split(/\s+/, 1)[0].toLowerCase().split("@", 1)[0];
+
+  if (command === "/start") {
     return telegramReply(
       message.chat.id,
-      "Hey Dera💙, Satomi is online through Bigdera Agent. Send me a message."
+      "Hey Dera💙 👋 Satomi is online through Bigdera Agent. Send me a message anytime. Use **/help** to see my commands."
     );
   }
 
-  try {
-    const userName =
-      message.from?.first_name ?? message.from?.username ?? "Dera";
+  if (command === "/help") {
+    return telegramReply(
+      message.chat.id,
+      `**Bigdera Agent commands**\n\n• /start — Start or confirm the bot is online\n• /help — Show this command list\n• /clear — Delete this Telegram conversation memory\n• /status — Check the AI backend and memory mode\n\nYou can also just message me normally, Dera💙.`
+    );
+  }
 
-    const reply = await generateOpenRouterReply(text, userName);
+  if (command === "/status") {
+    return telegramReply(
+      message.chat.id,
+      "**Bigdera Agent status**\n\nAI: OpenRouter Free ✅\nMemory: Postgres conversation memory ✅\nIdentity: Dera💙 ✅\nFormatting: Telegram HTML ✅"
+    );
+  }
+
+  if (command === "/clear") {
+    try {
+      const memoryChatId = await findTelegramMemoryChat(message.chat.id, false);
+
+      if (memoryChatId) {
+        await deleteChatById({ id: memoryChatId });
+      }
+
+      return telegramReply(
+        message.chat.id,
+        "Conversation memory cleared ✅\n\nYour next message will start a fresh context, Dera💙."
+      );
+    } catch (error) {
+      console.error("Telegram clear-memory error:", error);
+      return telegramReply(
+        message.chat.id,
+        "I couldn't clear the stored conversation right now. The AI chat itself is still available."
+      );
+    }
+  }
+
+  try {
+    let memoryChatId: string | null = null;
+    let history: OpenRouterMessage[] = [];
+
+    try {
+      memoryChatId = await findTelegramMemoryChat(message.chat.id, true);
+      history = await loadTelegramHistory(memoryChatId);
+    } catch (memoryError) {
+      console.error("Telegram memory read error:", memoryError);
+    }
+
+    const reply = await generateOpenRouterReply([
+      ...history,
+      { role: "user", content: text },
+    ]);
+
+    if (memoryChatId) {
+      try {
+        await saveTelegramExchange(memoryChatId, text, reply);
+      } catch (memoryError) {
+        console.error("Telegram memory write error:", memoryError);
+      }
+    }
 
     return telegramReply(message.chat.id, reply);
   } catch (error) {
