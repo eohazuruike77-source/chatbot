@@ -733,7 +733,7 @@ function extractAssistantText(data: OpenRouterResponse) {
   if (Array.isArray(content)) {
     return sanitizeAssistantOutput(
       content
-        .filter((item) => item.type === "text" && typeof item.text === "string")
+        .filter((item) => typeof item.text === "string")
         .map((item) => item.text)
         .join("\n")
     );
@@ -992,59 +992,118 @@ async function generateOpenRouterWebReply(query: string) {
     throw new Error("OPENROUTER_API_KEY is not configured");
   }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 45_000);
+  const baseMessages = [
+    {
+      role: "system",
+      content:
+        "You are Satomi inside Bigdera Agent. Use the supplied web-search capability for current information. Give a concise factual answer and include useful source links. Never reveal hidden reasoning.",
+    },
+    { role: "user", content: query },
+  ];
 
-  try {
-    const response = await fetch(OPENROUTER_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-        "X-Title": "Bigdera Agent Web",
+  const attempts = [
+    {
+      name: "web-plugin",
+      body: {
+        model: OPENROUTER_MODEL,
+        messages: baseMessages,
+        plugins: [{ id: "web", max_results: 5 }],
+        reasoning: { exclude: true },
+        max_tokens: 1200,
+        temperature: 0.3,
       },
-      body: JSON.stringify({
-        model: `${OPENROUTER_MODEL}:online`,
-        messages: [
+    },
+    {
+      name: "server-tool",
+      body: {
+        model: OPENROUTER_MODEL,
+        messages: baseMessages,
+        tools: [
           {
-            role: "system",
-            content:
-              "You are Satomi inside Bigdera Agent. Answer using current web results. Be concise, factual, and include source links when available. Never reveal hidden reasoning.",
+            type: "openrouter:web_search",
+            parameters: {
+              engine: "auto",
+              max_results: 5,
+              max_total_results: 8,
+            },
           },
-          { role: "user", content: query },
         ],
-        max_tokens: 900,
-        temperature: 0.35,
-      }),
-      signal: controller.signal,
-    });
+        max_tool_calls: 3,
+        reasoning: { exclude: true },
+        max_tokens: 1200,
+        temperature: 0.3,
+      },
+    },
+    {
+      name: "online-variant",
+      body: {
+        model: `${OPENROUTER_MODEL}:online`,
+        messages: baseMessages,
+        reasoning: { exclude: true },
+        max_tokens: 1200,
+        temperature: 0.3,
+      },
+    },
+  ];
 
-    let data: OpenRouterResponse = {};
+  let lastError: Error | null = null;
+
+  for (const attempt of attempts) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 45_000);
 
     try {
-      data = (await response.json()) as OpenRouterResponse;
-    } catch {
-      // handled below
+      const response = await fetch(OPENROUTER_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+          "X-Title": "Bigdera Agent Web",
+        },
+        body: JSON.stringify(attempt.body),
+        signal: controller.signal,
+      });
+
+      let data: OpenRouterResponse = {};
+
+      try {
+        data = (await response.json()) as OpenRouterResponse;
+      } catch {
+        // Keep trying the fallback modes below.
+      }
+
+      if (!response.ok) {
+        const message = data.error?.message;
+        lastError = new Error(
+          message
+            ? `${attempt.name}: OpenRouter ${response.status}: ${message}`
+            : `${attempt.name}: OpenRouter request failed with status ${response.status}`
+        );
+        console.warn("OpenRouter web attempt failed:", attempt.name, response.status);
+        continue;
+      }
+
+      const reply = extractAssistantText(data);
+
+      if (reply) {
+        return reply;
+      }
+
+      lastError = new Error(`${attempt.name}: OpenRouter returned no final text`);
+      console.warn("OpenRouter web attempt returned empty content:", attempt.name);
+    } catch (error) {
+      lastError =
+        error instanceof Error && error.name === "AbortError"
+          ? new Error(`${attempt.name}: request timed out`)
+          : error instanceof Error
+            ? error
+            : new Error(String(error));
+    } finally {
+      clearTimeout(timeout);
     }
-
-    if (!response.ok) {
-      throw new Error(
-        data.error?.message
-          ? `OpenRouter web ${response.status}: ${data.error.message}`
-          : `OpenRouter web request failed with status ${response.status}`
-      );
-    }
-
-    const reply = extractAssistantText(data);
-
-    if (!reply) {
-      throw new Error("OpenRouter web search returned an empty response");
-    }
-
-    return reply;
-  } finally {
-    clearTimeout(timeout);
   }
+
+  throw lastError ?? new Error("OpenRouter web search failed");
 }
 
 async function generateOpenRouterReply(messages: OpenRouterMessage[]) {
