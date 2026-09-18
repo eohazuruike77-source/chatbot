@@ -236,8 +236,7 @@ function extractAssistantText(data: OpenRouterResponse) {
       content
         .filter((item) => item.type === "text" && typeof item.text === "string")
         .map((item) => item.text)
-        .join("
-")
+        .join("\n")
     );
   }
 
