@@ -150,6 +150,7 @@ const TELEGRAM_COMMANDS = [
   { command: "weather", description: "Get live weather for a city" },
   { command: "calc", description: "Calculate an arithmetic expression" },
   { command: "wiki", description: "Look up a topic on Wikipedia" },
+  { command: "web", description: "Search the live web" },
   { command: "clear", description: "Clear conversation memory" },
 ] as const;
 
@@ -174,8 +175,9 @@ const TELEGRAM_TOOLS_BUTTONS = {
     ],
     [
       { text: "📚 Wikipedia", callback_data: "tool:wiki" },
-      { text: "↩️ Main Menu", callback_data: "action:help" },
+      { text: "🌐 Web Search", callback_data: "tool:web" },
     ],
+    [{ text: "↩️ Main Menu", callback_data: "action:help" }],
   ],
 };
 
@@ -330,7 +332,13 @@ const BIGDERA_TOOLS_TEXT = [
   "📚 **Wikipedia**",
   "/wiki opportunity cost",
   "",
-  "These utility tools run directly and do not use your OpenRouter daily AI allowance.",
+  "🌐 **Web Search**",
+  "/web latest AI news",
+  "",
+  "🔗 **URL Reader**",
+  "Paste a public http/https webpage link and I can summarize it.",
+  "",
+  "Weather, calculator, and Wikipedia are direct utilities. Web Search and URL Reader use OpenRouter AI.",
 ].join("\n");
 
 function weatherCodeLabel(code: number) {
@@ -857,6 +865,186 @@ async function saveTelegramExchange(
       },
     ],
   });
+}
+
+function isPrivateHostname(hostname: string) {
+  const host = hostname.toLowerCase();
+
+  if (
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".local") ||
+    host === "0.0.0.0" ||
+    host === "::1"
+  ) {
+    return true;
+  }
+
+  const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+
+  if (ipv4) {
+    const octets = ipv4.slice(1).map(Number);
+
+    if (octets.some((value) => value > 255)) {
+      return true;
+    }
+
+    const [a, b] = octets;
+
+    return (
+      a === 10 ||
+      a === 127 ||
+      a === 0 ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168)
+    );
+  }
+
+  return false;
+}
+
+function extractFirstPublicUrl(text: string) {
+  const match = text.match(/https?:\/\/[^\s<>()]+/i);
+
+  if (!match) {
+    return null;
+  }
+
+  try {
+    const url = new URL(match[0]);
+
+    if (!["http:", "https:"].includes(url.protocol) || isPrivateHostname(url.hostname)) {
+      return null;
+    }
+
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+function htmlToReadableText(html: string) {
+  return html
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<!--([\s\S]*?)-->/g, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function fetchPublicPage(url: URL) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12_000);
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 BigderaAgent/1.0",
+        Accept: "text/html,text/plain;q=0.9,*/*;q=0.1",
+      },
+      redirect: "follow",
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Page fetch failed with status ${response.status}`);
+    }
+
+    const finalUrl = new URL(response.url);
+    if (isPrivateHostname(finalUrl.hostname)) {
+      throw new Error("Redirected to a private or local address");
+    }
+
+    const contentType = response.headers.get("content-type") ?? "";
+
+    if (!contentType.includes("text/html") && !contentType.includes("text/plain")) {
+      throw new Error("That URL is not a readable text webpage");
+    }
+
+    const body = (await response.text()).slice(0, 250_000);
+    const readable = contentType.includes("text/html")
+      ? htmlToReadableText(body)
+      : body.replace(/\s+/g, " ").trim();
+
+    if (!readable) {
+      throw new Error("The webpage did not contain readable text");
+    }
+
+    return readable.slice(0, 18_000);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function generateOpenRouterWebReply(query: string) {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+
+  if (!apiKey) {
+    throw new Error("OPENROUTER_API_KEY is not configured");
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 45_000);
+
+  try {
+    const response = await fetch(OPENROUTER_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        "X-Title": "Bigdera Agent Web",
+      },
+      body: JSON.stringify({
+        model: `${OPENROUTER_MODEL}:online`,
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are Satomi inside Bigdera Agent. Answer using current web results. Be concise, factual, and include source links when available. Never reveal hidden reasoning.",
+          },
+          { role: "user", content: query },
+        ],
+        max_tokens: 900,
+        temperature: 0.35,
+      }),
+      signal: controller.signal,
+    });
+
+    let data: OpenRouterResponse = {};
+
+    try {
+      data = (await response.json()) as OpenRouterResponse;
+    } catch {
+      // handled below
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        data.error?.message
+          ? `OpenRouter web ${response.status}: ${data.error.message}`
+          : `OpenRouter web request failed with status ${response.status}`
+      );
+    }
+
+    const reply = extractAssistantText(data);
+
+    if (!reply) {
+      throw new Error("OpenRouter web search returned an empty response");
+    }
+
+    return reply;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function generateOpenRouterReply(messages: OpenRouterMessage[]) {
