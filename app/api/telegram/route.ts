@@ -489,7 +489,9 @@ export async function POST(request: Request) {
 
     try {
       memoryChatId = await findTelegramMemoryChat(message.chat.id, true);
-      history = await loadTelegramHistory(memoryChatId);
+      if (memoryChatId) {
+        history = await loadTelegramHistory(memoryChatId);
+      }
     } catch (memoryError) {
       console.error("Telegram memory read error:", memoryError);
     }
