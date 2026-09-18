@@ -30,9 +30,16 @@ type TelegramMessage = {
   };
 };
 
+type TelegramCallbackQuery = {
+  id: string;
+  data?: string;
+  message?: TelegramMessage;
+};
+
 type TelegramUpdate = {
   update_id: number;
   message?: TelegramMessage;
+  callback_query?: TelegramCallbackQuery;
 };
 
 type OpenRouterMessage = {
@@ -109,7 +116,11 @@ function toTelegramHtml(input: string) {
   return text.trim();
 }
 
-function telegramReply(chatId: number, text: string) {
+function telegramReply(
+  chatId: number,
+  text: string,
+  replyMarkup?: Record<string, unknown>
+) {
   const trimmed =
     text.length > TELEGRAM_SAFE_REPLY_LIMIT
       ? `${text.slice(0, TELEGRAM_SAFE_REPLY_LIMIT)}\n\n[truncated]`
@@ -127,6 +138,7 @@ function telegramReply(chatId: number, text: string) {
     text: safeText,
     parse_mode: "HTML",
     disable_web_page_preview: true,
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
   });
 }
 
@@ -136,6 +148,25 @@ const TELEGRAM_COMMANDS = [
   { command: "status", description: "Check AI, memory, and typing status" },
   { command: "clear", description: "Clear conversation memory" },
 ] as const;
+
+const TELEGRAM_ACTION_BUTTONS = {
+  inline_keyboard: [
+    [
+      { text: "🟢 Status", callback_data: "action:status" },
+      { text: "❓ Help", callback_data: "action:help" },
+    ],
+    [{ text: "🧠 Clear Memory", callback_data: "action:clear" }],
+  ],
+};
+
+const TELEGRAM_CLEAR_CONFIRM_BUTTONS = {
+  inline_keyboard: [
+    [
+      { text: "✅ Yes, clear it", callback_data: "action:clear_confirm" },
+      { text: "↩️ Cancel", callback_data: "action:clear_cancel" },
+    ],
+  ],
+};
 
 async function ensureTelegramCommandMenu() {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
@@ -171,6 +202,27 @@ async function ensureTelegramCommandMenu() {
   } catch (error) {
     console.error("Telegram command-menu setup error:", error);
     return false;
+  }
+}
+
+async function answerTelegramCallback(callbackQueryId: string, text?: string) {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+
+  if (!botToken) {
+    return;
+  }
+
+  try {
+    await fetch(`https://api.telegram.org/bot${botToken}/answerCallbackQuery`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        callback_query_id: callbackQueryId,
+        ...(text ? { text } : {}),
+      }),
+    });
+  } catch (error) {
+    console.error("Telegram callback-answer error:", error);
   }
 }
 
@@ -523,6 +575,74 @@ export async function POST(request: Request) {
     return new Response("Invalid JSON", { status: 400 });
   }
 
+  const callback = update.callback_query;
+
+  if (callback?.message && callback.data) {
+    const chatId = callback.message.chat.id;
+
+    if (callback.data === "action:status") {
+      await answerTelegramCallback(callback.id);
+      return telegramReply(
+        chatId,
+        `**Bigdera Agent status**\n\nAI: OpenRouter Free ✅\nMemory: Postgres conversation memory ✅\nIdentity: Dera💙 ✅\nFormatting: Telegram HTML ✅\nTyping: ${process.env.TELEGRAM_BOT_TOKEN ? "Enabled ✅" : "Waiting for TELEGRAM_BOT_TOKEN ⚠️"}`,
+        TELEGRAM_ACTION_BUTTONS
+      );
+    }
+
+    if (callback.data === "action:help") {
+      await answerTelegramCallback(callback.id);
+      return telegramReply(
+        chatId,
+        `**Bigdera Agent commands**\n\n• /start — Start or confirm the bot is online\n• /help — Show this command list\n• /clear — Delete this Telegram conversation memory\n• /status — Check the AI backend and memory mode\n\nYou can also just message me normally, Dera💙.`,
+        TELEGRAM_ACTION_BUTTONS
+      );
+    }
+
+    if (callback.data === "action:clear") {
+      await answerTelegramCallback(callback.id);
+      return telegramReply(
+        chatId,
+        "Clear this Telegram conversation memory? This cannot be undone.",
+        TELEGRAM_CLEAR_CONFIRM_BUTTONS
+      );
+    }
+
+    if (callback.data === "action:clear_confirm") {
+      try {
+        const memoryChatId = await findTelegramMemoryChat(chatId, false);
+        if (memoryChatId) {
+          await deleteChatById({ id: memoryChatId });
+        }
+        await answerTelegramCallback(callback.id, "Memory cleared ✅");
+        return telegramReply(
+          chatId,
+          "Conversation memory cleared ✅\n\nYour next message will start a fresh context, Dera💙.",
+          TELEGRAM_ACTION_BUTTONS
+        );
+      } catch (error) {
+        console.error("Telegram inline clear-memory error:", error);
+        await answerTelegramCallback(callback.id, "Could not clear memory.");
+        return telegramReply(
+          chatId,
+          "I could not clear the stored conversation right now. Nothing was deleted.",
+          TELEGRAM_ACTION_BUTTONS
+        );
+      }
+    }
+
+    if (callback.data === "action:clear_cancel") {
+      await answerTelegramCallback(callback.id, "Cancelled");
+      return telegramReply(
+        chatId,
+        "Memory clear cancelled. Nothing was deleted. 👍",
+        TELEGRAM_ACTION_BUTTONS
+      );
+    }
+
+    await answerTelegramCallback(callback.id);
+    return Response.json({ ok: true });
+  }
+
   const message = update.message;
   const text = message?.text?.trim();
 
@@ -537,21 +657,24 @@ export async function POST(request: Request) {
 
     return telegramReply(
       message.chat.id,
-      "Hey Dera💙 👋 Satomi is online through Bigdera Agent. Send me a message anytime. Use **/help** to see my commands."
+      "Hey Dera💙 👋 Satomi is online through Bigdera Agent. Send me a message anytime. Use **/help** to see my commands.",
+      TELEGRAM_ACTION_BUTTONS
     );
   }
 
   if (command === "/help") {
     return telegramReply(
       message.chat.id,
-      `**Bigdera Agent commands**\n\n• /start — Start or confirm the bot is online\n• /help — Show this command list\n• /clear — Delete this Telegram conversation memory\n• /status — Check the AI backend and memory mode\n\nYou can also just message me normally, Dera💙.`
+      `**Bigdera Agent commands**\n\n• /start — Start or confirm the bot is online\n• /help — Show this command list\n• /clear — Delete this Telegram conversation memory\n• /status — Check the AI backend and memory mode\n\nYou can also just message me normally, Dera💙.`,
+      TELEGRAM_ACTION_BUTTONS
     );
   }
 
   if (command === "/status") {
     return telegramReply(
       message.chat.id,
-      `**Bigdera Agent status**\n\nAI: OpenRouter Free ✅\nMemory: Postgres conversation memory ✅\nIdentity: Dera💙 ✅\nFormatting: Telegram HTML ✅\nTyping: ${process.env.TELEGRAM_BOT_TOKEN ? "Enabled ✅" : "Waiting for TELEGRAM_BOT_TOKEN ⚠️"}`
+      `**Bigdera Agent status**\n\nAI: OpenRouter Free ✅\nMemory: Postgres conversation memory ✅\nIdentity: Dera💙 ✅\nFormatting: Telegram HTML ✅\nTyping: ${process.env.TELEGRAM_BOT_TOKEN ? "Enabled ✅" : "Waiting for TELEGRAM_BOT_TOKEN ⚠️"}`,
+      TELEGRAM_ACTION_BUTTONS
     );
   }
 
