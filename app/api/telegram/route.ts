@@ -145,7 +145,11 @@ function telegramReply(
 const TELEGRAM_COMMANDS = [
   { command: "start", description: "Start Bigdera Agent" },
   { command: "help", description: "Show available commands" },
-  { command: "status", description: "Check AI, memory, and typing status" },
+  { command: "status", description: "Check AI, memory, tools, and typing" },
+  { command: "tools", description: "Show utility tools" },
+  { command: "weather", description: "Get live weather for a city" },
+  { command: "calc", description: "Calculate an arithmetic expression" },
+  { command: "wiki", description: "Look up a topic on Wikipedia" },
   { command: "clear", description: "Clear conversation memory" },
 ] as const;
 
@@ -155,7 +159,23 @@ const TELEGRAM_ACTION_BUTTONS = {
       { text: "🟢 Status", callback_data: "action:status" },
       { text: "❓ Help", callback_data: "action:help" },
     ],
-    [{ text: "🧠 Clear Memory", callback_data: "action:clear" }],
+    [
+      { text: "🧰 Tools", callback_data: "action:tools" },
+      { text: "🧠 Clear Memory", callback_data: "action:clear" },
+    ],
+  ],
+};
+
+const TELEGRAM_TOOLS_BUTTONS = {
+  inline_keyboard: [
+    [
+      { text: "🌦 Weather", callback_data: "tool:weather" },
+      { text: "🧮 Calculator", callback_data: "tool:calc" },
+    ],
+    [
+      { text: "📚 Wikipedia", callback_data: "tool:wiki" },
+      { text: "↩️ Main Menu", callback_data: "action:help" },
+    ],
   ],
 };
 
@@ -294,6 +314,347 @@ function startTyping(chatId: number) {
     stopped = true;
     clearInterval(timer);
   };
+}
+
+const BIGDERA_TOOLS_TEXT = [
+  "**Bigdera Agent tools**",
+  "",
+  "🌦 **Weather**",
+  "/weather Benin City",
+  "or say: weather in Benin City",
+  "",
+  "🧮 **Calculator**",
+  "/calc (25000 * 15%) + 500",
+  "or say: calculate 144 / 12",
+  "",
+  "📚 **Wikipedia**",
+  "/wiki opportunity cost",
+  "",
+  "These utility tools run directly and do not use your OpenRouter daily AI allowance.",
+].join("\n");
+
+function weatherCodeLabel(code: number) {
+  if (code === 0) return "Clear sky";
+  if ([1, 2, 3].includes(code)) return "Partly cloudy";
+  if ([45, 48].includes(code)) return "Foggy";
+  if ([51, 53, 55, 56, 57].includes(code)) return "Drizzle";
+  if ([61, 63, 65, 66, 67].includes(code)) return "Rain";
+  if ([71, 73, 75, 77].includes(code)) return "Snow";
+  if ([80, 81, 82].includes(code)) return "Rain showers";
+  if ([85, 86].includes(code)) return "Snow showers";
+  if ([95, 96, 99].includes(code)) return "Thunderstorm";
+  return "Mixed conditions";
+}
+
+async function getWeatherTool(locationQuery: string) {
+  const query = locationQuery.trim();
+
+  if (!query) {
+    throw new Error("Usage: /weather <city>");
+  }
+
+  const geocodeUrl =
+    "https://geocoding-api.open-meteo.com/v1/search?count=1&language=en&format=json&name=" +
+    encodeURIComponent(query);
+
+  const geocodeResponse = await fetch(geocodeUrl, {
+    signal: AbortSignal.timeout(8000),
+  });
+
+  if (!geocodeResponse.ok) {
+    throw new Error("Weather location lookup failed");
+  }
+
+  const geocode = (await geocodeResponse.json()) as {
+    results?: Array<{
+      name: string;
+      latitude: number;
+      longitude: number;
+      country?: string;
+      admin1?: string;
+    }>;
+  };
+
+  const place = geocode.results?.[0];
+
+  if (!place) {
+    throw new Error(
+      'I could not find "' +
+        query +
+        '". Try a city plus country, e.g. Benin City, Nigeria.'
+    );
+  }
+
+  const forecastUrl =
+    "https://api.open-meteo.com/v1/forecast?latitude=" +
+    place.latitude +
+    "&longitude=" +
+    place.longitude +
+    "&current=temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,weather_code,wind_speed_10m" +
+    "&temperature_unit=celsius&wind_speed_unit=kmh&timezone=auto";
+
+  const forecastResponse = await fetch(forecastUrl, {
+    signal: AbortSignal.timeout(8000),
+  });
+
+  if (!forecastResponse.ok) {
+    throw new Error("Weather service is temporarily unavailable");
+  }
+
+  const forecast = (await forecastResponse.json()) as {
+    current?: {
+      temperature_2m?: number;
+      apparent_temperature?: number;
+      relative_humidity_2m?: number;
+      precipitation?: number;
+      weather_code?: number;
+      wind_speed_10m?: number;
+    };
+  };
+
+  const current = forecast.current;
+
+  if (!current || typeof current.temperature_2m !== "number") {
+    throw new Error("Weather service returned incomplete data");
+  }
+
+  const locationName = [place.name, place.admin1, place.country]
+    .filter(Boolean)
+    .join(", ");
+
+  const condition =
+    typeof current.weather_code === "number"
+      ? weatherCodeLabel(current.weather_code)
+      : "Current conditions";
+
+  const lines = [
+    "🌦 **Weather — " + locationName + "**",
+    "",
+    condition,
+    "🌡 Temperature: **" + current.temperature_2m + "°C**",
+  ];
+
+  if (typeof current.apparent_temperature === "number") {
+    lines.push("Feels like: " + current.apparent_temperature + "°C");
+  }
+  if (typeof current.relative_humidity_2m === "number") {
+    lines.push("💧 Humidity: " + current.relative_humidity_2m + "%");
+  }
+  if (typeof current.wind_speed_10m === "number") {
+    lines.push("💨 Wind: " + current.wind_speed_10m + " km/h");
+  }
+  if (typeof current.precipitation === "number") {
+    lines.push("🌧 Precipitation: " + current.precipitation + " mm");
+  }
+
+  lines.push("", "Source: Open-Meteo");
+  return lines.join("\n");
+}
+
+function calculateExpression(rawExpression: string) {
+  const input = rawExpression
+    .replace(/,/g, "")
+    .replace(/[×xX]/g, "*")
+    .replace(/÷/g, "/")
+    .trim();
+
+  if (!input) {
+    throw new Error("Usage: /calc <expression>");
+  }
+
+  if (!/^[0-9+\-*/^().%\s]+$/.test(input)) {
+    throw new Error(
+      "Calculator supports numbers, +, -, *, /, ^, %, and parentheses."
+    );
+  }
+
+  let index = 0;
+
+  const skipWhitespace = () => {
+    while (/\s/.test(input[index] ?? "")) index += 1;
+  };
+
+  const consume = (character: string) => {
+    skipWhitespace();
+    if (input[index] === character) {
+      index += 1;
+      return true;
+    }
+    return false;
+  };
+
+  const parseNumber = () => {
+    skipWhitespace();
+    const start = index;
+    let seenDot = false;
+
+    while (index < input.length) {
+      const character = input[index];
+      if (character === ".") {
+        if (seenDot) break;
+        seenDot = true;
+        index += 1;
+        continue;
+      }
+      if (!/[0-9]/.test(character)) break;
+      index += 1;
+    }
+
+    if (start === index || input.slice(start, index) === ".") {
+      throw new Error("Invalid number in expression");
+    }
+
+    return Number(input.slice(start, index));
+  };
+
+  const parsePrimary = (): number => {
+    if (consume("(")) {
+      const value = parseExpression();
+      if (!consume(")")) throw new Error("Missing closing parenthesis");
+      return value;
+    }
+    return parseNumber();
+  };
+
+  const parsePostfix = (): number => {
+    let value = parsePrimary();
+    while (consume("%")) value /= 100;
+    return value;
+  };
+
+  const parseUnary = (): number => {
+    if (consume("+")) return parseUnary();
+    if (consume("-")) return -parseUnary();
+    return parsePostfix();
+  };
+
+  const parsePower = (): number => {
+    const base = parseUnary();
+    if (consume("^")) return Math.pow(base, parsePower());
+    return base;
+  };
+
+  const parseTerm = (): number => {
+    let value = parsePower();
+
+    while (true) {
+      if (consume("*")) {
+        value *= parsePower();
+      } else if (consume("/")) {
+        const divisor = parsePower();
+        if (divisor === 0) throw new Error("Division by zero is undefined");
+        value /= divisor;
+      } else {
+        break;
+      }
+    }
+
+    return value;
+  };
+
+  function parseExpression(): number {
+    let value = parseTerm();
+
+    while (true) {
+      if (consume("+")) {
+        value += parseTerm();
+      } else if (consume("-")) {
+        value -= parseTerm();
+      } else {
+        break;
+      }
+    }
+
+    return value;
+  }
+
+  const result = parseExpression();
+  skipWhitespace();
+
+  if (index !== input.length) {
+    throw new Error(
+      'Unexpected character near "' + input.slice(index, index + 10) + '"'
+    );
+  }
+
+  if (!Number.isFinite(result)) {
+    throw new Error("Result is not a finite number");
+  }
+
+  return Number.parseFloat(result.toPrecision(12));
+}
+
+async function getWikipediaTool(topicQuery: string) {
+  const topic = topicQuery.trim();
+
+  if (!topic) {
+    throw new Error("Usage: /wiki <topic>");
+  }
+
+  const url =
+    "https://en.wikipedia.org/w/api.php?action=query&format=json&redirects=1&prop=extracts%7Cinfo&exintro=1&explaintext=1&inprop=url&titles=" +
+    encodeURIComponent(topic);
+
+  const response = await fetch(url, {
+    headers: {
+      "User-Agent": "BigderaAgent/1.0 (Telegram assistant)",
+    },
+    signal: AbortSignal.timeout(8000),
+  });
+
+  if (!response.ok) {
+    throw new Error("Wikipedia is temporarily unavailable");
+  }
+
+  const data = (await response.json()) as {
+    query?: {
+      pages?: Record<
+        string,
+        {
+          title?: string;
+          extract?: string;
+          missing?: string;
+        }
+      >;
+    };
+  };
+
+  const page = Object.values(data.query?.pages ?? {})[0];
+
+  if (!page || page.missing !== undefined || !page.extract) {
+    throw new Error('No Wikipedia summary found for "' + topic + '".');
+  }
+
+  const summary =
+    page.extract.length > 1200
+      ? page.extract.slice(0, 1200).trimEnd() + "…"
+      : page.extract;
+
+  return [
+    "📚 **" + (page.title ?? topic) + "**",
+    "",
+    summary,
+    "",
+    "Source: Wikipedia",
+  ].join("\n");
+}
+
+function extractNaturalWeatherQuery(text: string) {
+  const match = text.match(/^weather\s+(?:in|for)\s+(.+)$/i);
+  return match?.[1]?.trim() || null;
+}
+
+function extractNaturalCalculation(text: string) {
+  const match = text.match(/^(?:calculate|calc|what is)\s+(.+)$/i);
+  const candidate = match?.[1]?.trim();
+
+  if (!candidate || !/[0-9]/.test(candidate)) {
+    return null;
+  }
+
+  return /^[0-9+\-*/^().%,×xX÷\s]+$/.test(candidate)
+    ? candidate
+    : null;
 }
 
 function sanitizeAssistantOutput(input: string) {
@@ -618,7 +979,7 @@ export async function POST(request: Request) {
       await answerTelegramCallback(callback.id);
       return telegramReply(
         chatId,
-        `**Bigdera Agent status**\n\nAI: OpenRouter Free ✅\nMemory: Postgres conversation memory ✅\nIdentity: Dera💙 ✅\nFormatting: Telegram HTML ✅\nTyping: ${process.env.TELEGRAM_BOT_TOKEN ? "Enabled ✅" : "Waiting for TELEGRAM_BOT_TOKEN ⚠️"}`,
+        `**Bigdera Agent status**\n\nAI: OpenRouter Free ✅\nMemory: Postgres conversation memory ✅\nTools: Weather + Calculator + Wikipedia ✅\nIdentity: Dera💙 ✅\nFormatting: Telegram HTML ✅\nTyping: ${process.env.TELEGRAM_BOT_TOKEN ? "Enabled ✅" : "Waiting for TELEGRAM_BOT_TOKEN ⚠️"}`,
         TELEGRAM_ACTION_BUTTONS
       );
     }
@@ -627,8 +988,44 @@ export async function POST(request: Request) {
       await answerTelegramCallback(callback.id);
       return telegramReply(
         chatId,
-        `**Bigdera Agent commands**\n\n• /start — Start or confirm the bot is online\n• /help — Show this command list\n• /clear — Delete this Telegram conversation memory\n• /status — Check the AI backend and memory mode\n\nYou can also just message me normally, Dera💙.`,
+        `**Bigdera Agent commands**\n\n• /start — Start or confirm the bot is online\n• /help — Show this command list\n• /clear — Delete this Telegram conversation memory\n• /status — Check the AI backend and memory mode\n• /tools — Show utility tools\n• /weather <city> — Live weather\n• /calc <expression> — Calculator\n• /wiki <topic> — Wikipedia lookup\n\nYou can also just message me normally, Dera💙.`,
         TELEGRAM_ACTION_BUTTONS
+      );
+    }
+
+    if (callback.data === "action:tools") {
+      await answerTelegramCallback(callback.id);
+      return telegramReply(
+        chatId,
+        BIGDERA_TOOLS_TEXT,
+        TELEGRAM_TOOLS_BUTTONS
+      );
+    }
+
+    if (callback.data === "tool:weather") {
+      await answerTelegramCallback(callback.id);
+      return telegramReply(
+        chatId,
+        "🌦 Send **/weather <city>**\n\nExample: /weather Benin City",
+        TELEGRAM_TOOLS_BUTTONS
+      );
+    }
+
+    if (callback.data === "tool:calc") {
+      await answerTelegramCallback(callback.id);
+      return telegramReply(
+        chatId,
+        "🧮 Send **/calc <expression>**\n\nExample: /calc (25000 * 15%) + 500",
+        TELEGRAM_TOOLS_BUTTONS
+      );
+    }
+
+    if (callback.data === "tool:wiki") {
+      await answerTelegramCallback(callback.id);
+      return telegramReply(
+        chatId,
+        "📚 Send **/wiki <topic>**\n\nExample: /wiki opportunity cost",
+        TELEGRAM_TOOLS_BUTTONS
       );
     }
 
@@ -702,7 +1099,7 @@ export async function POST(request: Request) {
   if (command === "/help") {
     return telegramReply(
       message.chat.id,
-      `**Bigdera Agent commands**\n\n• /start — Start or confirm the bot is online\n• /help — Show this command list\n• /clear — Delete this Telegram conversation memory\n• /status — Check the AI backend and memory mode\n\nYou can also just message me normally, Dera💙.`,
+      `**Bigdera Agent commands**\n\n• /start — Start or confirm the bot is online\n• /help — Show this command list\n• /clear — Delete this Telegram conversation memory\n• /status — Check the AI backend and memory mode\n• /tools — Show utility tools\n• /weather <city> — Live weather\n• /calc <expression> — Calculator\n• /wiki <topic> — Wikipedia lookup\n\nYou can also just message me normally, Dera💙.`,
       TELEGRAM_ACTION_BUTTONS
     );
   }
@@ -710,9 +1107,94 @@ export async function POST(request: Request) {
   if (command === "/status") {
     return telegramReply(
       message.chat.id,
-      `**Bigdera Agent status**\n\nAI: OpenRouter Free ✅\nMemory: Postgres conversation memory ✅\nIdentity: Dera💙 ✅\nFormatting: Telegram HTML ✅\nTyping: ${process.env.TELEGRAM_BOT_TOKEN ? "Enabled ✅" : "Waiting for TELEGRAM_BOT_TOKEN ⚠️"}`,
+      `**Bigdera Agent status**\n\nAI: OpenRouter Free ✅\nMemory: Postgres conversation memory ✅\nTools: Weather + Calculator + Wikipedia ✅\nIdentity: Dera💙 ✅\nFormatting: Telegram HTML ✅\nTyping: ${process.env.TELEGRAM_BOT_TOKEN ? "Enabled ✅" : "Waiting for TELEGRAM_BOT_TOKEN ⚠️"}`,
       TELEGRAM_ACTION_BUTTONS
     );
+  }
+
+  if (command === "/tools") {
+    return telegramReply(
+      message.chat.id,
+      BIGDERA_TOOLS_TEXT,
+      TELEGRAM_TOOLS_BUTTONS
+    );
+  }
+
+  if (command === "/weather") {
+    const locationQuery = text.slice(command.length).trim();
+
+    if (!locationQuery) {
+      return telegramReply(
+        message.chat.id,
+        "Usage: **/weather <city>**\nExample: /weather Benin City",
+        TELEGRAM_TOOLS_BUTTONS
+      );
+    }
+
+    const stopToolTyping = startTyping(message.chat.id);
+    try {
+      return telegramReply(
+        message.chat.id,
+        await getWeatherTool(locationQuery),
+        TELEGRAM_TOOLS_BUTTONS
+      );
+    } catch (error) {
+      return telegramReply(
+        message.chat.id,
+        "Weather error: " + sanitizeError(error),
+        TELEGRAM_TOOLS_BUTTONS
+      );
+    } finally {
+      stopToolTyping();
+    }
+  }
+
+  if (command === "/calc") {
+    const expression = text.slice(command.length).trim();
+
+    try {
+      const result = calculateExpression(expression);
+      return telegramReply(
+        message.chat.id,
+        "🧮 **Result:** " + result,
+        TELEGRAM_TOOLS_BUTTONS
+      );
+    } catch (error) {
+      return telegramReply(
+        message.chat.id,
+        "Calculator error: " + sanitizeError(error),
+        TELEGRAM_TOOLS_BUTTONS
+      );
+    }
+  }
+
+  if (command === "/wiki") {
+    const topic = text.slice(command.length).trim();
+
+    if (!topic) {
+      return telegramReply(
+        message.chat.id,
+        "Usage: **/wiki <topic>**\nExample: /wiki opportunity cost",
+        TELEGRAM_TOOLS_BUTTONS
+      );
+    }
+
+    const stopToolTyping = startTyping(message.chat.id);
+    try {
+      return telegramReply(
+        message.chat.id,
+        await getWikipediaTool(topic),
+        TELEGRAM_TOOLS_BUTTONS
+      );
+    } catch (error) {
+      return telegramReply(
+        message.chat.id,
+        "Wikipedia error: " + sanitizeError(error),
+        TELEGRAM_TOOLS_BUTTONS
+      );
+    } finally {
+      stopToolTyping();
+    }
   }
 
   if (command === "/clear") {
@@ -732,6 +1214,44 @@ export async function POST(request: Request) {
       return telegramReply(
         message.chat.id,
         "I couldn't clear the stored conversation right now. The AI chat itself is still available."
+      );
+    }
+  }
+
+  const naturalWeatherQuery = extractNaturalWeatherQuery(text);
+  if (naturalWeatherQuery) {
+    const stopToolTyping = startTyping(message.chat.id);
+    try {
+      return telegramReply(
+        message.chat.id,
+        await getWeatherTool(naturalWeatherQuery),
+        TELEGRAM_TOOLS_BUTTONS
+      );
+    } catch (error) {
+      return telegramReply(
+        message.chat.id,
+        "Weather error: " + sanitizeError(error),
+        TELEGRAM_TOOLS_BUTTONS
+      );
+    } finally {
+      stopToolTyping();
+    }
+  }
+
+  const naturalCalculation = extractNaturalCalculation(text);
+  if (naturalCalculation) {
+    try {
+      const result = calculateExpression(naturalCalculation);
+      return telegramReply(
+        message.chat.id,
+        "🧮 **Result:** " + result,
+        TELEGRAM_TOOLS_BUTTONS
+      );
+    } catch (error) {
+      return telegramReply(
+        message.chat.id,
+        "Calculator error: " + sanitizeError(error),
+        TELEGRAM_TOOLS_BUTTONS
       );
     }
   }
