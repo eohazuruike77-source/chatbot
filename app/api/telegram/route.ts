@@ -130,6 +130,50 @@ function telegramReply(chatId: number, text: string) {
   });
 }
 
+const TELEGRAM_COMMANDS = [
+  { command: "start", description: "Start Bigdera Agent" },
+  { command: "help", description: "Show available commands" },
+  { command: "status", description: "Check AI, memory, and typing status" },
+  { command: "clear", description: "Clear conversation memory" },
+] as const;
+
+async function ensureTelegramCommandMenu() {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+
+  if (!botToken) {
+    return false;
+  }
+
+  try {
+    const [commandsResponse, menuResponse] = await Promise.all([
+      fetch(`https://api.telegram.org/bot${botToken}/setMyCommands`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ commands: TELEGRAM_COMMANDS }),
+      }),
+      fetch(`https://api.telegram.org/bot${botToken}/setChatMenuButton`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ menu_button: { type: "commands" } }),
+      }),
+    ]);
+
+    if (!commandsResponse.ok || !menuResponse.ok) {
+      console.error(
+        "Telegram command-menu setup failed:",
+        commandsResponse.status,
+        menuResponse.status
+      );
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    console.error("Telegram command-menu setup error:", error);
+    return false;
+  }
+}
+
 async function sendTelegramChatAction(chatId: number, action: "typing") {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
 
@@ -455,11 +499,14 @@ async function generateOpenRouterReply(messages: OpenRouterMessage[]) {
 }
 
 export async function GET() {
+  const commandMenu = await ensureTelegramCommandMenu();
+
   return Response.json({
     ok: true,
     service: "Bigdera Agent Telegram bridge",
     ai: "OpenRouter Free",
     memory: "Postgres",
+    commandMenu: commandMenu ? "registered" : "unavailable",
   });
 }
 
@@ -486,6 +533,8 @@ export async function POST(request: Request) {
   const command = text.split(/\s+/, 1)[0].toLowerCase().split("@", 1)[0];
 
   if (command === "/start") {
+    void ensureTelegramCommandMenu();
+
     return telegramReply(
       message.chat.id,
       "Hey Dera💙 👋 Satomi is online through Bigdera Agent. Send me a message anytime. Use **/help** to see my commands."
