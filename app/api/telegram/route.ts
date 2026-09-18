@@ -1167,7 +1167,7 @@ export async function POST(request: Request) {
       await answerTelegramCallback(callback.id);
       return telegramReply(
         chatId,
-        `**Bigdera Agent status**\n\nAI: OpenRouter Free ✅\nMemory: Postgres conversation memory ✅\nTools: Weather + Calculator + Wikipedia ✅\nIdentity: Dera💙 ✅\nFormatting: Telegram HTML ✅\nTyping: ${process.env.TELEGRAM_BOT_TOKEN ? "Enabled ✅" : "Waiting for TELEGRAM_BOT_TOKEN ⚠️"}`,
+        `**Bigdera Agent status**\n\nAI: OpenRouter Free ✅\nMemory: Postgres conversation memory ✅\nTools: Weather + Calculator + Wikipedia + Web + URL Reader ✅\nIdentity: Dera💙 ✅\nFormatting: Telegram HTML ✅\nTyping: ${process.env.TELEGRAM_BOT_TOKEN ? "Enabled ✅" : "Waiting for TELEGRAM_BOT_TOKEN ⚠️"}`,
         TELEGRAM_ACTION_BUTTONS
       );
     }
@@ -1176,7 +1176,7 @@ export async function POST(request: Request) {
       await answerTelegramCallback(callback.id);
       return telegramReply(
         chatId,
-        `**Bigdera Agent commands**\n\n• /start — Start or confirm the bot is online\n• /help — Show this command list\n• /clear — Delete this Telegram conversation memory\n• /status — Check the AI backend and memory mode\n• /tools — Show utility tools\n• /weather <city> — Live weather\n• /calc <expression> — Calculator\n• /wiki <topic> — Wikipedia lookup\n\nYou can also just message me normally, Dera💙.`,
+        `**Bigdera Agent commands**\n\n• /start — Start or confirm the bot is online\n• /help — Show this command list\n• /clear — Delete this Telegram conversation memory\n• /status — Check the AI backend and memory mode\n• /tools — Show utility tools\n• /weather <city> — Live weather\n• /calc <expression> — Calculator\n• /wiki <topic> — Wikipedia lookup\n• /web <query> — Live web search\n\nYou can also paste a public webpage URL for a summary.\n\nYou can also just message me normally, Dera💙.`,
         TELEGRAM_ACTION_BUTTONS
       );
     }
@@ -1213,6 +1213,15 @@ export async function POST(request: Request) {
       return telegramReply(
         chatId,
         "📚 Send **/wiki <topic>**\n\nExample: /wiki opportunity cost",
+        TELEGRAM_TOOLS_BUTTONS
+      );
+    }
+
+    if (callback.data === "tool:web") {
+      await answerTelegramCallback(callback.id);
+      return telegramReply(
+        chatId,
+        "🌐 Send **/web <query>**\n\nExample: /web latest AI news today",
         TELEGRAM_TOOLS_BUTTONS
       );
     }
@@ -1287,7 +1296,7 @@ export async function POST(request: Request) {
   if (command === "/help") {
     return telegramReply(
       message.chat.id,
-      `**Bigdera Agent commands**\n\n• /start — Start or confirm the bot is online\n• /help — Show this command list\n• /clear — Delete this Telegram conversation memory\n• /status — Check the AI backend and memory mode\n• /tools — Show utility tools\n• /weather <city> — Live weather\n• /calc <expression> — Calculator\n• /wiki <topic> — Wikipedia lookup\n\nYou can also just message me normally, Dera💙.`,
+      `**Bigdera Agent commands**\n\n• /start — Start or confirm the bot is online\n• /help — Show this command list\n• /clear — Delete this Telegram conversation memory\n• /status — Check the AI backend and memory mode\n• /tools — Show utility tools\n• /weather <city> — Live weather\n• /calc <expression> — Calculator\n• /wiki <topic> — Wikipedia lookup\n• /web <query> — Live web search\n\nYou can also paste a public webpage URL for a summary.\n\nYou can also just message me normally, Dera💙.`,
       TELEGRAM_ACTION_BUTTONS
     );
   }
@@ -1295,7 +1304,7 @@ export async function POST(request: Request) {
   if (command === "/status") {
     return telegramReply(
       message.chat.id,
-      `**Bigdera Agent status**\n\nAI: OpenRouter Free ✅\nMemory: Postgres conversation memory ✅\nTools: Weather + Calculator + Wikipedia ✅\nIdentity: Dera💙 ✅\nFormatting: Telegram HTML ✅\nTyping: ${process.env.TELEGRAM_BOT_TOKEN ? "Enabled ✅" : "Waiting for TELEGRAM_BOT_TOKEN ⚠️"}`,
+      `**Bigdera Agent status**\n\nAI: OpenRouter Free ✅\nMemory: Postgres conversation memory ✅\nTools: Weather + Calculator + Wikipedia + Web + URL Reader ✅\nIdentity: Dera💙 ✅\nFormatting: Telegram HTML ✅\nTyping: ${process.env.TELEGRAM_BOT_TOKEN ? "Enabled ✅" : "Waiting for TELEGRAM_BOT_TOKEN ⚠️"}`,
       TELEGRAM_ACTION_BUTTONS
     );
   }
@@ -1385,6 +1394,34 @@ export async function POST(request: Request) {
     }
   }
 
+  if (command === "/web") {
+    const query = text.replace(/^\/web(?:@\w+)?\s*/i, "").trim();
+
+    if (!query) {
+      return telegramReply(
+        message.chat.id,
+        "🌐 Usage: **/web <query>**\n\nExample: /web latest AI news today",
+        TELEGRAM_TOOLS_BUTTONS
+      );
+    }
+
+    const stopToolTyping = startTyping(message.chat.id);
+
+    try {
+      const reply = await generateOpenRouterWebReply(query);
+      return telegramReply(message.chat.id, reply, TELEGRAM_TOOLS_BUTTONS);
+    } catch (error) {
+      console.error("Telegram web-search error:", error);
+      return telegramReply(
+        message.chat.id,
+        `Web search error: ${sanitizeError(error)}`,
+        TELEGRAM_TOOLS_BUTTONS
+      );
+    } finally {
+      stopToolTyping();
+    }
+  }
+
   if (command === "/clear") {
     try {
       const memoryChatId = await findTelegramMemoryChat(message.chat.id, false);
@@ -1441,6 +1478,34 @@ export async function POST(request: Request) {
         "Calculator error: " + sanitizeError(error),
         TELEGRAM_TOOLS_BUTTONS
       );
+    }
+  }
+
+  const publicUrl = extractFirstPublicUrl(text);
+
+  if (publicUrl) {
+    const stopToolTyping = startTyping(message.chat.id);
+
+    try {
+      const pageText = await fetchPublicPage(publicUrl);
+      const reply = await generateOpenRouterReply([
+        {
+          role: "user",
+          content:
+            `Summarize this webpage clearly. Mention the key points and anything important or actionable. Source URL: ${publicUrl.toString()}\n\nWEBPAGE TEXT:\n${pageText}`,
+        },
+      ]);
+
+      return telegramReply(message.chat.id, reply, TELEGRAM_ACTION_BUTTONS);
+    } catch (error) {
+      console.error("Telegram URL-reader error:", error);
+      return telegramReply(
+        message.chat.id,
+        `URL reader error: ${sanitizeError(error)}`,
+        TELEGRAM_ACTION_BUTTONS
+      );
+    } finally {
+      stopToolTyping();
     }
   }
 
