@@ -168,6 +168,40 @@ const TELEGRAM_CLEAR_CONFIRM_BUTTONS = {
   ],
 };
 
+async function ensureTelegramWebhook(webhookUrl: string) {
+  const botToken = process.env.TELEGRAM_BOT_TOKEN;
+  const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
+
+  if (!botToken || !webhookSecret) {
+    return false;
+  }
+
+  try {
+    const response = await fetch(
+      `https://api.telegram.org/bot${botToken}/setWebhook`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          url: webhookUrl,
+          secret_token: webhookSecret,
+          allowed_updates: ["message", "callback_query"],
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      console.error("Telegram webhook refresh failed:", response.status);
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    console.error("Telegram webhook refresh error:", error);
+    return false;
+  }
+}
+
 async function ensureTelegramCommandMenu() {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
 
@@ -653,7 +687,10 @@ export async function POST(request: Request) {
   const command = text.split(/\s+/, 1)[0].toLowerCase().split("@", 1)[0];
 
   if (command === "/start") {
-    void ensureTelegramCommandMenu();
+    await Promise.all([
+      ensureTelegramCommandMenu(),
+      ensureTelegramWebhook(request.url),
+    ]);
 
     return telegramReply(
       message.chat.id,
